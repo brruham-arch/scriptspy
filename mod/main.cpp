@@ -181,13 +181,38 @@ EXPORT void OnModLoad() {
     }
     logf_("[ScriptSpy] Dobby resolver + hook OK");
 
-    // ── Resolve luaL_loadbuffer di libluajit-5.1.so ───────────────────────
-    void* target = resolver("libluajit-5.1.so", "luaL_loadbuffer");
+    // ── Resolve luaL_loadbuffer via dlopen+dlsym ──────────────────────────
+    // DobbySymbolResolver tidak reliable jika lib belum ter-load saat hook
+    // dlopen RTLD_NOLOAD = ambil handle yang sudah ada di memori, tidak load ulang
+    const char* lua_libs[] = {
+        "libluajit-5.1.so",
+        "libluajit.so",
+        "liblua51.so",
+        "liblua.so",
+        "libmonetloader.so",  // fallback: mungkin Lua embedded di sini
+        nullptr
+    };
+
+    void* target = nullptr;
+    for (int i = 0; lua_libs[i]; i++) {
+        void* hLib = dlopen(lua_libs[i], RTLD_NOW | RTLD_GLOBAL);
+        if (!hLib) {
+            logff_("[ScriptSpy] skip %s (tidak ter-load)", lua_libs[i]);
+            continue;
+        }
+        target = dlsym(hLib, "luaL_loadbuffer");
+        if (target) {
+            logff_("[ScriptSpy] luaL_loadbuffer ditemukan di %s addr=%p",
+                   lua_libs[i], target);
+            break;
+        }
+        logff_("[ScriptSpy] %s ada tapi luaL_loadbuffer tidak ada", lua_libs[i]);
+    }
+
     if (!target) {
-        logf_("[ScriptSpy] ERROR: luaL_loadbuffer tidak ditemukan");
+        logf_("[ScriptSpy] ERROR: luaL_loadbuffer tidak ditemukan di semua lib");
         return;
     }
-    logff_("[ScriptSpy] luaL_loadbuffer addr = %p", target);
 
     // ── Pasang hook ───────────────────────────────────────────────────────
     int ret = dobbyHook(
