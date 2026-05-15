@@ -12,8 +12,6 @@
 #define DUMPDIR  "/storage/emulated/0/ScriptSpy"
 #define EXPORT   __attribute__((visibility("default")))
 
-// ─── Logging ────────────────────────────────────────────────────────────────
-
 static void logf_(const char* msg) {
     FILE* f = fopen(LOGFILE, "a");
     if (f) { fprintf(f, "%s\n", msg); fclose(f); }
@@ -29,97 +27,74 @@ static void logff_(const char* fmt, ...) {
     logf_(buf);
 }
 
-// ─── Lua types (minimal, cukup untuk hook) ──────────────────────────────────
-
 typedef struct lua_State lua_State;
-
-typedef int (*luaL_loadbuffer_t)(lua_State* L,
-                                  const char* buff,
-                                  size_t sz,
-                                  const char* name);
-
+typedef int (*luaL_loadbuffer_t)(lua_State*, const char*, size_t, const char*);
 static luaL_loadbuffer_t orig_loadbuffer = nullptr;
-
-// ─── State ──────────────────────────────────────────────────────────────────
 
 static int  g_enabled    = 1;
 static int  g_dump_count = 0;
-
-// ─── Helper: sanitize nama file ─────────────────────────────────────────────
 
 static void sanitize_name(const char* src, char* dst, size_t dsz) {
     size_t j = 0;
     for (size_t i = 0; src[i] && j + 1 < dsz; i++) {
         char c = src[i];
-        if ((c >= 'a' && c <= 'z') ||
-            (c >= 'A' && c <= 'Z') ||
-            (c >= '0' && c <= '9') ||
-            c == '_' || c == '-' || c == '.') {
+        if ((c>='a'&&c<='z')||(c>='A'&&c<='Z')||(c>='0'&&c<='9')||
+             c=='_'||c=='-'||c=='.') {
             dst[j++] = c;
-        } else if (c == '/' || c == '\\') {
+        } else if (c=='/'||c=='\\') {
             dst[j++] = '_';
         }
     }
     dst[j] = '\0';
-    if (j == 0) {
-        snprintf(dst, dsz, "unknown_%d", g_dump_count);
-    }
+    if (j == 0) snprintf(dst, dsz, "unknown_%d", g_dump_count);
 }
-
-// ─── Hook: luaL_loadbuffer ──────────────────────────────────────────────────
 
 static int hook_loadbuffer(lua_State* L,
                             const char* buff,
                             size_t sz,
                             const char* name)
 {
+    // DIAGNOSTIK — log setiap panggilan tanpa syarat
+    logff_("[ScriptSpy] hook_loadbuffer! name=%s sz=%zu",
+           name ? name : "(null)", sz);
+
     if (g_enabled && buff && sz > 0) {
         g_dump_count++;
 
-        // Tentukan ekstensi: bytecode LuaJIT = "\x1bLJ", Lua plain = teks
         int is_bytecode = (sz >= 3 &&
                            (unsigned char)buff[0] == 0x1b &&
                            buff[1] == 'L' && buff[2] == 'J');
 
-        // Bersihkan nama chunk (kadang diawali '@' = path file)
         const char* raw_name = name ? name : "chunk";
-        if (raw_name[0] == '@') raw_name++;  // strip '@' prefix
+        if (raw_name[0] == '@') raw_name++;
 
         char safe_name[128];
         sanitize_name(raw_name, safe_name, sizeof(safe_name));
 
-        // Timestamp singkat untuk hindari overwrite
         char ts[32];
         struct timespec tp;
         clock_gettime(CLOCK_MONOTONIC, &tp);
         snprintf(ts, sizeof(ts), "%ld", tp.tv_sec % 100000);
 
-        // Path output
         char outpath[512];
         snprintf(outpath, sizeof(outpath), "%s/%s_%s%s",
-                 DUMPDIR,
-                 safe_name,
-                 ts,
+                 DUMPDIR, safe_name, ts,
                  is_bytecode ? ".luajit" : ".lua");
 
-        // Tulis file
         FILE* f = fopen(outpath, "wb");
         if (f) {
             fwrite(buff, 1, sz, f);
             fclose(f);
-            logff_("[ScriptSpy] #%d dump: %s (%zu bytes, %s)",
+            logff_("[ScriptSpy] #%d dump OK: %s (%zu bytes, %s)",
                    g_dump_count, outpath, sz,
                    is_bytecode ? "bytecode" : "plaintext");
         } else {
-            logff_("[ScriptSpy] #%d GAGAL tulis: %s", g_dump_count, outpath);
+            logff_("[ScriptSpy] #%d GAGAL fopen: %s", g_dump_count, outpath);
         }
     }
 
-    // Panggil fungsi asli — tidak ada yang berubah di game
     return orig_loadbuffer(L, buff, sz, name);
 }
-
-// ─── API struct ─────────────────────────────────────────────────────────────
 
 static void  _spy_enable(void)   { g_enabled = 1;  logf_("[ScriptSpy] enabled");  }
 static void  _spy_disable(void)  { g_enabled = 0;  logf_("[ScriptSpy] disabled"); }
@@ -133,63 +108,46 @@ struct ScriptSpyAPI {
     int  (*count)(void);
 };
 
-// ─── AML entry points ────────────────────────────────────────────────────────
-
 extern "C" {
 
 EXPORT ScriptSpyAPI scriptspy_api = {
-    _spy_enable,
-    _spy_disable,
-    _spy_is_on,
-    _spy_count,
+    _spy_enable, _spy_disable, _spy_is_on, _spy_count,
 };
 
 EXPORT void* __GetModInfo() {
     static const char* info =
-        "scriptspy|1.0|Lua Script Dumper via luaL_loadbuffer hook|brruham";
+        "scriptspy|1.1|Lua Script Dumper via luaL_loadbuffer hook|brruham";
     return (void*)info;
 }
 
 EXPORT void OnModPreLoad() {
-    // Bersihkan log lama
     remove(LOGFILE);
-    logf_("[ScriptSpy] OnModPreLoad v1.0");
-
-    // Buat direktori dump jika belum ada
+    logf_("[ScriptSpy] OnModPreLoad v1.1");
     mkdir(DUMPDIR, 0777);
 }
 
 EXPORT void OnModLoad() {
     logf_("[ScriptSpy] OnModLoad mulai");
 
-    // ── Load Dobby ────────────────────────────────────────────────────────
     void* hDobby = dlopen("libdobby.so", RTLD_NOW | RTLD_GLOBAL);
-    if (!hDobby) {
-        logf_("[ScriptSpy] ERROR: libdobby.so tidak bisa dibuka");
-        return;
-    }
+    if (!hDobby) { logf_("[ScriptSpy] ERROR: libdobby"); return; }
     logf_("[ScriptSpy] libdobby.so OK");
 
-    auto resolver = (void*(*)(const char*, const char*))
+    auto resolver = (void*(*)(const char*,const char*))
                         dlsym(hDobby, "DobbySymbolResolver");
-    auto dobbyHook = (int(*)(void*, void*, void**))
+    auto dobbyHook = (int(*)(void*,void*,void**))
                         dlsym(hDobby, "DobbyHook");
-
     if (!resolver || !dobbyHook) {
-        logf_("[ScriptSpy] ERROR: symbol Dobby tidak ditemukan");
-        return;
+        logf_("[ScriptSpy] ERROR: Dobby sym"); return;
     }
     logf_("[ScriptSpy] Dobby resolver + hook OK");
 
-    // ── Resolve luaL_loadbuffer via dlopen+dlsym ──────────────────────────
-    // DobbySymbolResolver tidak reliable jika lib belum ter-load saat hook
-    // dlopen RTLD_NOLOAD = ambil handle yang sudah ada di memori, tidak load ulang
     const char* lua_libs[] = {
         "libluajit-5.1.so",
         "libluajit.so",
         "liblua51.so",
         "liblua.so",
-        "libmonetloader.so",  // fallback: mungkin Lua embedded di sini
+        "libmonetloader.so",
         nullptr
     };
 
@@ -197,36 +155,28 @@ EXPORT void OnModLoad() {
     for (int i = 0; lua_libs[i]; i++) {
         void* hLib = dlopen(lua_libs[i], RTLD_NOW | RTLD_GLOBAL);
         if (!hLib) {
-            logff_("[ScriptSpy] skip %s (tidak ter-load)", lua_libs[i]);
+            logff_("[ScriptSpy] skip %s", lua_libs[i]);
             continue;
         }
         target = dlsym(hLib, "luaL_loadbuffer");
         if (target) {
-            logff_("[ScriptSpy] luaL_loadbuffer ditemukan di %s addr=%p",
-                   lua_libs[i], target);
+            logff_("[ScriptSpy] luaL_loadbuffer di %s addr=%p", lua_libs[i], target);
             break;
         }
-        logff_("[ScriptSpy] %s ada tapi luaL_loadbuffer tidak ada", lua_libs[i]);
+        logff_("[ScriptSpy] %s ada tapi simbol tidak ada", lua_libs[i]);
     }
 
     if (!target) {
-        logf_("[ScriptSpy] ERROR: luaL_loadbuffer tidak ditemukan di semua lib");
+        logf_("[ScriptSpy] ERROR: luaL_loadbuffer tidak ditemukan");
         return;
     }
 
-    // ── Pasang hook ───────────────────────────────────────────────────────
-    int ret = dobbyHook(
-        target,
-        (void*)hook_loadbuffer,
-        (void**)&orig_loadbuffer
-    );
-
+    int ret = dobbyHook(target, (void*)hook_loadbuffer, (void**)&orig_loadbuffer);
     if (ret != 0 || !orig_loadbuffer) {
-        logff_("[ScriptSpy] ERROR: DobbyHook gagal (ret=%d)", ret);
+        logff_("[ScriptSpy] ERROR: DobbyHook gagal ret=%d", ret);
         return;
     }
     logf_("[ScriptSpy] Hook terpasang! Siap dump script.");
-
     logf_("[ScriptSpy] OnModLoad SELESAI — monitoring aktif");
 }
 
