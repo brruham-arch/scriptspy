@@ -227,15 +227,7 @@ EXPORT void OnModLoad() {
     }
     logf_("[ScriptSpy] Hook terpasang! Siap dump script.");
 
-    // ── Simpan alamat API ke file untuk Lua bridge ────────────────────────
-    FILE* af = fopen("/storage/emulated/0/scriptspy_addr.txt", "w");
-    if (af) {
-        fprintf(af, "%lu\n", (unsigned long)&scriptspy_api);
-        fclose(af);
-        logf_("[ScriptSpy] addr disimpan ke scriptspy_addr.txt");
-    }
-
-    logf_("[ScriptSpy] OnModLoad SELESAI");
+    logf_("[ScriptSpy] OnModLoad SELESAI — monitoring aktif");
 }
 
 } // extern "C"
