@@ -24,15 +24,18 @@ static void logff_(const char* fmt, ...) {
 }
 
 typedef struct lua_State lua_State;
-typedef int (*luaL_loadbuffer_t) (lua_State*, const char*, size_t, const char*);
-typedef int (*luaL_loadbufferx_t)(lua_State*, const char*, size_t, const char*, const char*);
-typedef int (*lua_load_t)        (lua_State*, void*, void*, const char*);
+typedef const char* (*lua_Reader)(lua_State*, void*, size_t*);
+typedef int (*lua_load_t)(lua_State*, lua_Reader, void*, const char*);
 
-static luaL_loadbuffer_t  orig_loadbuffer  = nullptr;
-static luaL_loadbufferx_t orig_loadbufferx = nullptr;
+static lua_load_t orig_lua_load = nullptr;
 
-static int g_enabled    = 1;
-static int g_dump_count = 0;
+static int  g_enabled    = 1;
+static int  g_dump_count = 0;
+
+// Buffer akumulasi untuk tangkap semua chunk dari reader
+#define ACCUM_MAX (512 * 1024)  // 512KB max per script
+static char  g_accum[ACCUM_MAX];
+static size_t g_accum_sz = 0;
 
 static void sanitize_name(const char* src, char* dst, size_t dsz) {
     size_t j = 0;
@@ -47,10 +50,10 @@ static void sanitize_name(const char* src, char* dst, size_t dsz) {
 }
 
 static void do_dump(const char* buff, size_t sz, const char* name) {
+    if (!buff || sz == 0) return;
     g_dump_count++;
-    int is_bytecode = (sz >= 3 &&
-                       (unsigned char)buff[0] == 0x1b &&
-                       buff[1] == 'L' && buff[2] == 'J');
+    int is_bc = (sz >= 3 && (unsigned char)buff[0] == 0x1b &&
+                 buff[1] == 'L' && buff[2] == 'J');
     const char* raw = name ? name : "chunk";
     if (raw[0] == '@') raw++;
     char safe[128]; sanitize_name(raw, safe, sizeof(safe));
@@ -59,49 +62,72 @@ static void do_dump(const char* buff, size_t sz, const char* name) {
     snprintf(ts, sizeof(ts), "%ld", tp.tv_sec % 100000);
     char out[512];
     snprintf(out, sizeof(out), "%s/%s_%s%s",
-             DUMPDIR, safe, ts, is_bytecode ? ".luajit" : ".lua");
+             DUMPDIR, safe, ts, is_bc ? ".luajit" : ".lua");
     FILE* f = fopen(out, "wb");
-    if (f) { fwrite(buff, 1, sz, f); fclose(f);
-        logff_("[ScriptSpy] #%d OK: %s (%zu b, %s)",
-               g_dump_count, out, sz, is_bytecode ? "bc" : "txt");
+    if (f) {
+        fwrite(buff, 1, sz, f); fclose(f);
+        logff_("[ScriptSpy] #%d %s (%zu b, %s)",
+               g_dump_count, out, sz, is_bc ? "bytecode" : "plaintext");
     } else {
-        logff_("[ScriptSpy] #%d GAGAL fopen: %s", g_dump_count, out);
+        logff_("[ScriptSpy] #%d GAGAL fopen: %s errno=%d", g_dump_count, out, errno);
     }
 }
 
-static int hook_loadbuffer(lua_State* L, const char* buff, size_t sz, const char* name) {
-    logff_("[ScriptSpy] loadbuffer name=%s sz=%zu", name?name:"null", sz);
-    if (g_enabled && buff && sz > 0) do_dump(buff, sz, name);
-    return orig_loadbuffer(L, buff, sz, name);
+// Wrapper reader — akumulasi semua chunk lalu forward ke reader asli
+struct ReaderCtx {
+    lua_Reader  orig_reader;
+    void*       orig_data;
+    const char* chunkname;
+};
+
+static const char* spy_reader(lua_State* L, void* data, size_t* size) {
+    ReaderCtx* ctx = (ReaderCtx*)data;
+    const char* chunk = ctx->orig_reader(L, ctx->orig_data, size);
+    if (chunk && *size > 0 && g_enabled) {
+        size_t avail = ACCUM_MAX - g_accum_sz;
+        size_t copy  = (*size < avail) ? *size : avail;
+        memcpy(g_accum + g_accum_sz, chunk, copy);
+        g_accum_sz += copy;
+    }
+    return chunk;
 }
 
-static int hook_loadbufferx(lua_State* L, const char* buff, size_t sz,
-                             const char* name, const char* mode) {
-    logff_("[ScriptSpy] loadbufferx name=%s sz=%zu mode=%s",
-           name?name:"null", sz, mode?mode:"null");
-    if (g_enabled && buff && sz > 0) do_dump(buff, sz, name);
-    return orig_loadbufferx(L, buff, sz, name, mode);
+static int hook_lua_load(lua_State* L, lua_Reader reader,
+                          void* data, const char* chunkname)
+{
+    logff_("[ScriptSpy] lua_load name=%s", chunkname ? chunkname : "(null)");
+
+    if (!g_enabled) return orig_lua_load(L, reader, data, chunkname);
+
+    // Reset akumulator
+    g_accum_sz = 0;
+
+    // Wrap reader dengan spy_reader
+    ReaderCtx ctx;
+    ctx.orig_reader = reader;
+    ctx.orig_data   = data;
+    ctx.chunkname   = chunkname;
+
+    int ret = orig_lua_load(L, spy_reader, &ctx, chunkname);
+
+    // Dump hasil akumulasi
+    if (g_accum_sz > 0) {
+        do_dump(g_accum, g_accum_sz, chunkname);
+    } else {
+        logff_("[ScriptSpy] lua_load: akumulator kosong (reader tidak dipanggil?)");
+    }
+
+    return ret;
 }
 
-static void _spy_enable(void)  { g_enabled = 1; }
-static void _spy_disable(void) { g_enabled = 0; }
+static void _spy_enable(void)  { g_enabled = 1; logf_("[ScriptSpy] on");  }
+static void _spy_disable(void) { g_enabled = 0; logf_("[ScriptSpy] off"); }
 static int  _spy_is_on(void)   { return g_enabled; }
 static int  _spy_count(void)   { return g_dump_count; }
 struct ScriptSpyAPI {
     void(*enable)(void); void(*disable)(void);
     int (*is_on)(void);  int (*count)(void);
 };
-
-static int try_hook(void* dobbyHook_fn, void* hLib,
-                    const char* sym, void* hook_fn, void** orig_out) {
-    auto dHook = (int(*)(void*,void*,void**))dobbyHook_fn;
-    void* addr = dlsym(hLib, sym);
-    if (!addr) { logff_("[ScriptSpy] sym tidak ada: %s", sym); return -1; }
-    logff_("[ScriptSpy] %s addr=%p", sym, addr);
-    int r = dHook(addr, hook_fn, orig_out);
-    logff_("[ScriptSpy] hook %s ret=%d orig=%p", sym, r, *orig_out);
-    return r;
-}
 
 extern "C" {
 
@@ -110,13 +136,13 @@ EXPORT ScriptSpyAPI scriptspy_api = {
 };
 
 EXPORT void* __GetModInfo() {
-    static const char* info = "scriptspy|1.3|Lua Script Dumper|brruham";
+    static const char* info = "scriptspy|1.4|Lua Script Dumper via lua_load hook|brruham";
     return (void*)info;
 }
 
 EXPORT void OnModPreLoad() {
     remove(LOGFILE);
-    logf_("[ScriptSpy] OnModPreLoad v1.3");
+    logf_("[ScriptSpy] OnModPreLoad v1.4");
     mkdir(DUMPDIR, 0777);
 }
 
@@ -125,23 +151,26 @@ EXPORT void OnModLoad() {
 
     void* hDobby = dlopen("libdobby.so", RTLD_NOW | RTLD_GLOBAL);
     if (!hDobby) { logf_("[ScriptSpy] ERROR: libdobby"); return; }
-    void* dHook = dlsym(hDobby, "DobbyHook");
-    if (!dHook)  { logf_("[ScriptSpy] ERROR: DobbyHook sym"); return; }
+    auto dobbyHook = (int(*)(void*,void*,void**))dlsym(hDobby, "DobbyHook");
+    if (!dobbyHook) { logf_("[ScriptSpy] ERROR: DobbyHook"); return; }
 
     void* hLua = dlopen("libluajit-5.1.so", RTLD_NOW | RTLD_NOLOAD);
     if (!hLua) hLua = dlopen("libluajit-5.1.so", RTLD_NOW | RTLD_LOCAL);
     if (!hLua) { logf_("[ScriptSpy] ERROR: libluajit"); return; }
-    logff_("[ScriptSpy] hLua=%p", hLua);
 
-    // Hook luaL_loadbuffer
-    try_hook(dHook, hLua, "luaL_loadbuffer",
-             (void*)hook_loadbuffer, (void**)&orig_loadbuffer);
+    void* addr = dlsym(hLua, "lua_load");
+    if (!addr) { logf_("[ScriptSpy] ERROR: lua_load tidak ditemukan"); return; }
+    logff_("[ScriptSpy] lua_load addr=%p", addr);
 
-    // Hook luaL_loadbufferx
-    try_hook(dHook, hLua, "luaL_loadbufferx",
-             (void*)hook_loadbufferx, (void**)&orig_loadbufferx);
+    int ret = dobbyHook(addr, (void*)hook_lua_load, (void**)&orig_lua_load);
+    logff_("[ScriptSpy] DobbyHook ret=%d orig=%p", ret, orig_lua_load);
 
-    logf_("[ScriptSpy] selesai — monitoring aktif");
+    if (ret != 0 || !orig_lua_load) {
+        logf_("[ScriptSpy] ERROR: hook gagal");
+        return;
+    }
+
+    logf_("[ScriptSpy] Hook lua_load terpasang! Monitoring aktif.");
 }
 
 } // extern "C"
