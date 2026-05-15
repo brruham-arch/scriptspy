@@ -6,6 +6,7 @@
 #include <android/log.h>
 #include <sys/stat.h>
 #include <time.h>
+#include <errno.h>
 
 #define LOG_TAG "libscriptspy"
 #define LOGFILE "/storage/emulated/0/scriptspy_log.txt"
