@@ -17,13 +17,9 @@ static void logf_(const char* msg) {
     if (f) { fprintf(f, "%s\n", msg); fclose(f); }
     __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, "%s", msg);
 }
-
 static void logff_(const char* fmt, ...) {
-    char buf[512];
-    va_list ap;
-    va_start(ap, fmt);
-    vsnprintf(buf, sizeof(buf), fmt, ap);
-    va_end(ap);
+    char buf[512]; va_list ap;
+    va_start(ap, fmt); vsnprintf(buf, sizeof(buf), fmt, ap); va_end(ap);
     logf_(buf);
 }
 
@@ -31,32 +27,24 @@ typedef struct lua_State lua_State;
 typedef int (*luaL_loadbuffer_t)(lua_State*, const char*, size_t, const char*);
 static luaL_loadbuffer_t orig_loadbuffer = nullptr;
 
-static int  g_enabled    = 1;
-static int  g_dump_count = 0;
+static int g_enabled    = 1;
+static int g_dump_count = 0;
 
 static void sanitize_name(const char* src, char* dst, size_t dsz) {
     size_t j = 0;
     for (size_t i = 0; src[i] && j + 1 < dsz; i++) {
         char c = src[i];
         if ((c>='a'&&c<='z')||(c>='A'&&c<='Z')||(c>='0'&&c<='9')||
-             c=='_'||c=='-'||c=='.') {
-            dst[j++] = c;
-        } else if (c=='/'||c=='\\') {
-            dst[j++] = '_';
-        }
+             c=='_'||c=='-'||c=='.') dst[j++] = c;
+        else if (c=='/'||c=='\\') dst[j++] = '_';
     }
     dst[j] = '\0';
     if (j == 0) snprintf(dst, dsz, "unknown_%d", g_dump_count);
 }
 
-static int hook_loadbuffer(lua_State* L,
-                            const char* buff,
-                            size_t sz,
-                            const char* name)
+static int hook_loadbuffer(lua_State* L, const char* buff, size_t sz, const char* name)
 {
-    // DIAGNOSTIK — log setiap panggilan tanpa syarat
-    logff_("[ScriptSpy] hook_loadbuffer! name=%s sz=%zu",
-           name ? name : "(null)", sz);
+    logff_("[ScriptSpy] HOOK DIPANGGIL name=%s sz=%zu", name ? name : "(null)", sz);
 
     if (g_enabled && buff && sz > 0) {
         g_dump_count++;
@@ -85,27 +73,22 @@ static int hook_loadbuffer(lua_State* L,
         if (f) {
             fwrite(buff, 1, sz, f);
             fclose(f);
-            logff_("[ScriptSpy] #%d dump OK: %s (%zu bytes, %s)",
-                   g_dump_count, outpath, sz,
-                   is_bytecode ? "bytecode" : "plaintext");
+            logff_("[ScriptSpy] #%d OK: %s (%zu bytes)", g_dump_count, outpath, sz);
         } else {
             logff_("[ScriptSpy] #%d GAGAL fopen: %s", g_dump_count, outpath);
         }
     }
-
     return orig_loadbuffer(L, buff, sz, name);
 }
 
-static void  _spy_enable(void)   { g_enabled = 1;  logf_("[ScriptSpy] enabled");  }
-static void  _spy_disable(void)  { g_enabled = 0;  logf_("[ScriptSpy] disabled"); }
-static int   _spy_is_on(void)    { return g_enabled; }
-static int   _spy_count(void)    { return g_dump_count; }
+static void _spy_enable(void)  { g_enabled = 1; }
+static void _spy_disable(void) { g_enabled = 0; }
+static int  _spy_is_on(void)   { return g_enabled; }
+static int  _spy_count(void)   { return g_dump_count; }
 
 struct ScriptSpyAPI {
-    void (*enable)(void);
-    void (*disable)(void);
-    int  (*is_on)(void);
-    int  (*count)(void);
+    void (*enable)(void); void (*disable)(void);
+    int  (*is_on)(void);  int  (*count)(void);
 };
 
 extern "C" {
@@ -116,13 +99,13 @@ EXPORT ScriptSpyAPI scriptspy_api = {
 
 EXPORT void* __GetModInfo() {
     static const char* info =
-        "scriptspy|1.1|Lua Script Dumper via luaL_loadbuffer hook|brruham";
+        "scriptspy|1.2|Lua Script Dumper|brruham";
     return (void*)info;
 }
 
 EXPORT void OnModPreLoad() {
     remove(LOGFILE);
-    logf_("[ScriptSpy] OnModPreLoad v1.1");
+    logf_("[ScriptSpy] OnModPreLoad v1.2");
     mkdir(DUMPDIR, 0777);
 }
 
@@ -131,53 +114,44 @@ EXPORT void OnModLoad() {
 
     void* hDobby = dlopen("libdobby.so", RTLD_NOW | RTLD_GLOBAL);
     if (!hDobby) { logf_("[ScriptSpy] ERROR: libdobby"); return; }
-    logf_("[ScriptSpy] libdobby.so OK");
 
-    auto resolver = (void*(*)(const char*,const char*))
-                        dlsym(hDobby, "DobbySymbolResolver");
     auto dobbyHook = (int(*)(void*,void*,void**))
                         dlsym(hDobby, "DobbyHook");
-    if (!resolver || !dobbyHook) {
-        logf_("[ScriptSpy] ERROR: Dobby sym"); return;
+    if (!dobbyHook) { logf_("[ScriptSpy] ERROR: DobbyHook sym"); return; }
+
+    // Buka libluajit secara spesifik — RTLD_NOLOAD jika sudah ada di memori
+    // RTLD_NOLOAD = tidak load ulang, ambil handle yang sudah ada
+    void* hLua = dlopen("libluajit-5.1.so", RTLD_NOW | RTLD_NOLOAD);
+    if (!hLua) {
+        logf_("[ScriptSpy] RTLD_NOLOAD gagal, coba load normal");
+        hLua = dlopen("libluajit-5.1.so", RTLD_NOW | RTLD_LOCAL);
     }
-    logf_("[ScriptSpy] Dobby resolver + hook OK");
+    if (!hLua) { logf_("[ScriptSpy] ERROR: libluajit tidak bisa dibuka"); return; }
+    logff_("[ScriptSpy] hLua handle = %p", hLua);
 
-    const char* lua_libs[] = {
-        "libluajit-5.1.so",
-        "libluajit.so",
-        "liblua51.so",
-        "liblua.so",
-        "libmonetloader.so",
-        nullptr
-    };
+    // Ambil alamat dari handle spesifik libluajit — bukan PLT stub
+    void* target = dlsym(hLua, "luaL_loadbuffer");
+    if (!target) { logf_("[ScriptSpy] ERROR: simbol tidak ditemukan"); return; }
+    logff_("[ScriptSpy] target addr = %p", target);
 
-    void* target = nullptr;
-    for (int i = 0; lua_libs[i]; i++) {
-        void* hLib = dlopen(lua_libs[i], RTLD_NOW | RTLD_GLOBAL);
-        if (!hLib) {
-            logff_("[ScriptSpy] skip %s", lua_libs[i]);
-            continue;
-        }
-        target = dlsym(hLib, "luaL_loadbuffer");
-        if (target) {
-            logff_("[ScriptSpy] luaL_loadbuffer di %s addr=%p", lua_libs[i], target);
-            break;
-        }
-        logff_("[ScriptSpy] %s ada tapi simbol tidak ada", lua_libs[i]);
-    }
-
-    if (!target) {
-        logf_("[ScriptSpy] ERROR: luaL_loadbuffer tidak ditemukan");
-        return;
-    }
-
+    // Cek apakah ini Thumb: bit 0 harus 0 dari dlsym, tapi coba +1 jika gagal
     int ret = dobbyHook(target, (void*)hook_loadbuffer, (void**)&orig_loadbuffer);
+    logff_("[ScriptSpy] DobbyHook ret=%d orig=%p", ret, orig_loadbuffer);
+
     if (ret != 0 || !orig_loadbuffer) {
-        logff_("[ScriptSpy] ERROR: DobbyHook gagal ret=%d", ret);
-        return;
+        // Coba dengan Thumb bit +1
+        logf_("[ScriptSpy] Coba Thumb bit...");
+        void* target_thumb = (void*)((uintptr_t)target | 1);
+        orig_loadbuffer = nullptr;
+        ret = dobbyHook(target_thumb, (void*)hook_loadbuffer, (void**)&orig_loadbuffer);
+        logff_("[ScriptSpy] Thumb retry ret=%d orig=%p", ret, orig_loadbuffer);
+        if (ret != 0 || !orig_loadbuffer) {
+            logf_("[ScriptSpy] ERROR: DobbyHook gagal total");
+            return;
+        }
     }
-    logf_("[ScriptSpy] Hook terpasang! Siap dump script.");
-    logf_("[ScriptSpy] OnModLoad SELESAI — monitoring aktif");
+
+    logf_("[ScriptSpy] Hook terpasang! Monitoring aktif.");
 }
 
 } // extern "C"
